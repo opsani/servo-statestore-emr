@@ -1,0 +1,9 @@
+.vscode
+__pycache__
+
+adjust
+config.yaml
+adjust.py
+measure.py
+properties.json
+properties_template.json

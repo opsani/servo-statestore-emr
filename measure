@@ -1,0 +1,415 @@
+#!/usr/bin/env python3
+import boto3
+import json
+import subprocess
+import time
+import yaml
+
+from jsonpath_ng.ext import parse
+
+import measure
+
+DRIVER_NAME = "emr"
+DRIVER_VERSION = "1.0.1"
+DRIVER_DESC = "An Optune measure driver for EMR"
+CFG_FILE = "./config.yaml"
+
+REQUIRED_CFG_FIELDS = [
+    "aws_region",
+    "cluster_base_name",
+    "cluster_deploy_cmd",
+    "cluster_destroy_cmd",
+    "measure_steps",
+    "settings_map"
+]
+ADJUST_QUERY_CMD = ["./adjust", "--query"]
+METRIC_NAME = "steps_exec_t"
+METRIC_UNIT = "seconds"
+
+PROP_JSON_TEMPLATE = "properties_template.json"
+PROP_JSON_TARGET = "properties.json"
+DFLT_EXPECTED_DURATION = 1*60*60 # 1h
+
+# EMR constants
+STEP_POLL_INTV=15
+MAX_DESCRIBE_STEP_RETRIES=5
+EMR_STEP_COMPLETED_STATUS = ["COMPLETED", "CANCELLED", "FAILED", "INTERRUPTED"]
+ST_COMPLETED = "COMPLETED"
+
+class EmrMeasure(measure.Measure):
+
+    def _parse_cfg(self):
+        try:
+            f = open(CFG_FILE)
+            d = yaml.load(f)
+        except yaml.error.YAMLError as e:
+            raise Exception("syntax error in {}: {}".format(CFG_FILE, str(e)))
+
+        # valcheck
+        assert(DRIVER_NAME in d), \
+            "Missing driver configuration: missing {} section".format(
+                DRIVER_NAME)
+
+        cfg = d[DRIVER_NAME]
+
+        for i in REQUIRED_CFG_FIELDS:
+            assert i in cfg, "{} missing from driver configuration".format(i)
+
+        # Make sure at least one metric is present
+        assert len(cfg["measure_steps"]) > 0, \
+            "At least one measure step needs to be defined"
+
+        return cfg
+
+    def _get_state(self):
+
+        # Get state from adjust driver
+        cmd = ADJUST_QUERY_CMD.copy()
+        cmd.append(self.app_id)
+        res = subprocess.run(cmd, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE)
+
+        assert res.returncode == 0, \
+            "failed to get current application state from adjust driver: " \
+            "err code: {}, stdout: {}, stderr: {}".format(
+                res.returncode, res.stdout, res.stderr)
+
+        # Parse adjust driver output
+        try:
+            app_state = json.loads(res.stdout)
+        except:
+            self.debug("Failed to parse JSON output from adjut driver. Error:")
+            raise
+
+        return app_state
+
+    def describe(self):
+
+        # Just to validate config
+        cfg = self._parse_cfg()
+
+        # Return metrics from config
+        return {METRIC_NAME: {"unit": METRIC_UNIT}}
+
+
+    def measure(self):
+
+        cfg = self._parse_cfg()
+
+        # Set expected duration, to be used in progress calculation
+        self._expected_t = cfg.get("expected_duration", DFLT_EXPECTED_DURATION)
+
+        app_state = self._get_state()
+
+        properties = {}
+
+        # Create a map of json_path-s and values to put in the properties JSON
+        for c, c_data in app_state["application"]["components"].items():
+            assert c in cfg["settings_map"], \
+                "Missing settings_map configuration for component {}".format(c)
+
+            for s, s_data in c_data["settings"].items():
+                assert s in cfg["settings_map"][c], \
+                    "Missing settings_map configuration for setting "\
+                    "{}, component {}".format(s, c)
+
+                json_path = cfg["settings_map"][c][s]
+                properties[json_path] = s_data["value"]
+
+        self.debug("Properties json_path-s: values", properties)
+
+        # Run EMR steps
+        emr = EmrStepRunnner(
+            region=cfg["aws_region"],
+            cluster_base_name=cfg["cluster_base_name"],
+            properties=properties,
+            pre_steps=cfg.get("pre_steps", []),
+            measure_steps=cfg["measure_steps"],
+            post_steps=cfg.get("post_steps", []),
+            deploy_cmd=cfg["cluster_deploy_cmd"],
+            destroy_cmd=cfg["cluster_destroy_cmd"],
+            debug=self.debug,
+        )
+
+        step_exec_t = emr.run_steps()
+
+        # Get metrics values
+        metrics = {
+            METRIC_NAME: {
+                "value": step_exec_t,
+                "unit": METRIC_UNIT,
+            }
+        }
+
+        # Return values
+        return metrics, {}
+
+    # Overwrite super in order to update progress before printing it
+    def print_progress(
+            self,
+            message=None,
+            msg_index=None,
+            stage=None,
+            stageprogress=None):
+
+        if hasattr(self, "_expected_t"):
+            # update progress based on how much time has elapsed
+            t_taken = time.time() - self.t_measure_start
+            self.progress = int(min(100.0, 100.0*((t_taken)/self._expected_t)))
+
+        # Call super
+        super().print_progress(message, msg_index, stage, stageprogress)
+
+
+class EmrStepRunnner():
+
+    def __init__(
+            self,
+            region,
+            cluster_base_name,
+            properties,
+            pre_steps,
+            measure_steps,
+            post_steps,
+            deploy_cmd,
+            destroy_cmd,
+            debug=print):
+
+        self.region = region
+        self.cluster_name = cluster_base_name + str(int(time.time()*1000.0))
+        self.properties = properties
+        self.measure_steps = measure_steps
+        self.steps = pre_steps + measure_steps + post_steps
+
+        self.deploy_cmd = deploy_cmd
+        self.destroy_cmd = destroy_cmd
+
+        self.debug = debug
+
+        self.emr_client = boto3.Session().client("emr", region_name=self.region)
+
+
+    def run_steps(self):
+        # Generate properties JSON
+        try:
+            self._generate_props_json()
+        except:
+            self.debug("Failed to generate properties JSON file")
+            raise
+
+        step_ids = {}
+        try:
+            # Create cluster
+            cluster_id = self._create_cluster()
+
+            # Add steps
+            step_ids = self._add_steps(cluster_id)
+
+            # Wait for steps to complete
+            self._wait_for_steps(cluster_id, step_ids.keys())
+
+        except Exception as e:
+            self.debug("Failed creating cluster and running steps")
+            self.debug("Error (full stack dump to follow after cleanup):", e)
+            raise
+        finally:
+            # Destroy cluster
+            try:
+                self._destroy_cluster()
+            except Exception as e:
+                self.debug("Failed to destroy cluster", self.cluster_name)
+                self.debug(e)
+
+        # Get Ids of steps that we want the duration of
+        measure_step_ids = [
+            id for id, data in step_ids.items() if data in self.measure_steps]
+
+        # Get steps duration
+        step_exec_t = self._get_step_exec_t(cluster_id, measure_step_ids)
+
+        return step_exec_t
+
+
+    def _create_cluster(self):
+        self.debug("Creating cluster", self.cluster_name)
+
+        # Replace cluster name in deploy_cmd
+        cmd = self.deploy_cmd.format(cluster_name=self.cluster_name)
+
+        out = self._run_cmd(cmd)
+
+        result_json = json.loads(out)
+
+        assert result_json["Status"] == "SUCCESS", \
+            "Cluster create had status: {}".format(result_json["Status"])
+
+        cluster_id = result_json["CLUSTER_ID"]
+        self.debug("Cluster {} created with id: {}".format(
+            self.cluster_name, cluster_id))
+
+        return cluster_id
+
+
+    def _add_steps(self, cluster_id):
+
+        r = self.emr_client.add_job_flow_steps(
+            JobFlowId=cluster_id,
+            Steps=self.steps)
+
+        # Index by step id
+        step_ids = {r["StepIds"][idx]: s for idx, s in enumerate(self.steps)}
+
+        self.debug("Added steps with ids:", step_ids.keys())
+
+        return step_ids
+
+
+    def _destroy_cluster(self):
+        self.debug("Destroying cluster", self.cluster_name)
+
+        # Replace cluster name in deploy_cmd
+        cmd = self.destroy_cmd.format(cluster_name=self.cluster_name)
+
+        out = self._run_cmd(cmd)
+
+        result_json = json.loads(out)
+
+        assert result_json["Status"] == "SUCCESS", \
+            "Cluster destroy failed with status: {}".format(result_json["Status"])
+
+        self.debug("Cluster destroyed successfully")
+
+
+    def _wait_for_steps(self, cluster_id, step_ids):
+
+        running_steps = step_ids
+
+        self.debug("Waiting for steps:", running_steps)
+
+        while len(running_steps) > 0:
+            running_steps = [
+                s_id for s_id in running_steps if self._step_is_running(
+                    cluster_id, s_id)]
+
+            self.debug("Running steps:", running_steps)
+
+            if len(running_steps) == 0:
+                break
+
+            time.sleep(STEP_POLL_INTV)
+
+        self.debug("All steps have completed")
+
+
+    def _step_is_running(self, cluster_id, step_id):
+
+        status = self._get_step_status(cluster_id, step_id)
+
+        return status["State"] not in EMR_STEP_COMPLETED_STATUS
+
+
+    def _get_step_status(self, cluster_id, step_id, attemp=0):
+
+        try:
+            r = self.emr_client.describe_step(
+                ClusterId=cluster_id,
+                StepId=step_id)
+
+            return r["Step"]["Status"]
+
+        # Handle ThrottlingException
+        except ClientError as e:
+            if e.response["Error"]["Code"] != "ThrottlingException":
+                raise
+
+            attempt = attempt + 1
+            if attemp >= MAX_DESCRIBE_STEP_RETRIES:
+                raise Exception(
+                    "Too many attempts ({}) trying to get status for step {}"\
+                        .format(attemp, step_id))
+
+            sleep_t = attempt * STEP_POLL_INTV
+            self.debug("Got ThrottlingException while trying to get status"\
+                "for step {}, sleeping {} seconds before retrying".format(
+                    step_id, sleep_t))
+
+            time.sleep(sleep_t)
+            return self._get_step_status(cluster_id, step_id, attemp)
+
+
+    def _get_step_exec_t(self, cluster_id, step_ids):
+
+        total_t = 0
+
+        errors = []
+        for step_id in step_ids:
+            status = self._get_step_status(cluster_id, step_id)
+            if status["State"] != ST_COMPLETED:
+                errors.append("{}: {}".format(step_id, status["State"]))
+                continue
+
+            # Get step duration (datetime.timedelta)
+            time_taken = status["Timeline"]["EndDateTime"] - \
+                status["Timeline"]["StartDateTime"]
+
+            total_t = total_t + time_taken.total_seconds()
+
+        if errors:
+            msg = "The following measure steps did not complete successfully: {}"\
+                .format(" ".join(errors))
+            raise Exception(msg)
+
+        return total_t
+
+
+    def _generate_props_json(self):
+        self.debug("Generating JSON properties file")
+
+        # Read file
+        with open(PROP_JSON_TEMPLATE) as json_file:
+            data = json.load(json_file)
+
+        # Update
+        for path, value in self.properties.items():
+
+            jsonpath_expr = parse(path)
+            match = jsonpath_expr.find(data)
+
+            assert match, \
+                "Failed to find path {} in properties JSON".format(path)
+
+            self.debug("Found matches for {}: {}".format(path, len(match)))
+
+            jsonpath_expr.update(data, str(value))
+
+        # Write file
+        with open(PROP_JSON_TARGET, 'w') as json_file:
+            json.dump(data, json_file, indent=2)
+
+
+    def _run_cmd(self, cmd):
+        self.debug("Running command", cmd)
+
+        r = subprocess.Popen(
+            cmd.split(), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            shell=False)
+
+        output, error = r.communicate()
+
+        assert r.returncode == 0, \
+            "Failed running command: {}. Exit code: {}. Error: {}".format(
+                cmd, r.returncode, error)
+
+        return output
+
+
+
+# initialize and run
+if __name__ == "__main__":
+    driver = EmrMeasure(
+        "{} {}".format(DRIVER_NAME, DRIVER_VERSION),
+        DRIVER_DESC,
+        supports_cancel=True,
+        progress_interval=30)
+
+    driver.run()
