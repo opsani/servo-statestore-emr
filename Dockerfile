@@ -3,7 +3,8 @@ FROM python:3.6-slim
 WORKDIR /servo
 
 # Install dependencies
-RUN pip3 install jsonpath_ng requests PyYAML boto3 awscli
+RUN pip3 install jsonpath_ng requests PyYAML boto3 awscli && \
+    apt update && apt install -y jq && apt clean -y
 
 
 # Install servo
