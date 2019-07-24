@@ -14,7 +14,7 @@ IMG_NAME=my-registry.com/opsani/servo-statestore-emr make container push
 
 ## Run Servo (as a docker container)
 ```
-docker run -d --name opsani-servo \
+docker run -d --network host --name opsani-servo \
     -v /path/to/optune_auth_token:/opt/optune/auth_token \
     -v /path/to/properties_template.json:/servo/properties_template.json
     -v /path/to/config.yaml:/servo/config.yaml \
