@@ -109,14 +109,23 @@ class EmrMeasure(measure.Measure):
                 "Missing settings_map configuration for component {}".format(c)
 
             for s, s_data in c_data["settings"].items():
-                assert s in cfg["settings_map"][c], \
-                    "Missing settings_map configuration for setting "\
-                    "{}, component {}".format(s, c)
-
+                if s not in cfg["settings_map"][c]:
+                    self.debug("No mapping for setting {}, component {}".format(
+                        s, c))
+                    continue
                 json_path = cfg["settings_map"][c][s]
                 properties[json_path] = s_data["value"]
 
         self.debug("Properties json_path-s: values", properties)
+
+        # Replace setting values in measure steps
+        for s in cfg["measure_steps"]:
+            if 'HadoopJarStep' in s and 'Args' in s['HadoopJarStep']:
+                s['HadoopJarStep']['Args'] = [
+                    x.format(**app_state) for x in s['HadoopJarStep']['Args']]
+
+        self.debug("Measure steps after replacing with setting values:",
+            cfg["measure_steps"])
 
         # Run EMR steps
         emr = EmrStepRunnner(
