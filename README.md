@@ -77,10 +77,15 @@ emr:
   # Map between component settings and path in the JSON properties file
   settings_map:
     master:
-      inst_type: "$.EMR[*].MasterInstanceType"
+      inst_type:
+        path: "$.EMR[*].MasterInstanceType"
     core:
-      inst_type: "$.EMR[*].CoreInstanceType"
-      replicas: "$.EMR[*].CoreInstanceCount"
+      inst_type:
+        path: "$.EMR[*].CoreInstanceType"
+      replicas:
+        path: "$.EMR[*].CoreInstanceCount"
+        xlate: "int(value)"     # Optional, configures how to translate values, i.e. float -> int
+
 
 
   components:

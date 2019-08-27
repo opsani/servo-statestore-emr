@@ -83,6 +83,9 @@ class EmrMeasure(measure.Measure):
 
         return app_state
 
+    def _value_xlate(self, value, expr):
+        return value if expr is None else eval(expr, {}, {"value": value})
+
     def describe(self):
 
         # Just to validate config
@@ -113,8 +116,9 @@ class EmrMeasure(measure.Measure):
                     self.debug("No mapping for setting {}, component {}".format(
                         s, c))
                     continue
-                json_path = cfg["settings_map"][c][s]
-                properties[json_path] = s_data["value"]
+                json_path = cfg["settings_map"][c][s]["path"]
+                properties[json_path] = self._value_xlate(
+                    s_data["value"], cfg["settings_map"][c][s].get("xlate"))
 
         self.debug("Properties json_path-s: values", properties)
 
