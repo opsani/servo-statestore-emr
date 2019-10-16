@@ -6,6 +6,7 @@ import time
 import yaml
 
 from jsonpath_ng.ext import parse
+from botocore.exceptions import ClientError
 
 import measure
 
